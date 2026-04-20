@@ -2,7 +2,7 @@ class ClaudeBoop < Formula
   desc "Cute notifications for Claude Code (permission prompts & generation complete)"
   homepage "https://github.com/akeenkarkare/homebrew-claude-boop"
   url "https://github.com/akeenkarkare/homebrew-claude-boop/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "PLACEHOLDER"
+  sha256 "6e31ac92910a40c7fa9a282905dc755c6f22d8b33f72daa2b921ad39d3550ad6"
   license "MIT"
   head "https://github.com/akeenkarkare/homebrew-claude-boop.git", branch: "main"
 
