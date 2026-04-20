@@ -121,12 +121,21 @@ fn install() -> Result<(), String> {
         .entry("hooks")
         .or_insert_with(|| json!({}));
 
-    add_hook(hooks, "Notification", "claude-boop play --event notification")?;
-    add_hook(hooks, "Stop", "claude-boop play --event stop")?;
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.canonicalize().ok())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "claude-boop".to_string());
+
+    let notif_cmd = format!("{exe} play --event notification");
+    let stop_cmd = format!("{exe} play --event stop");
+    add_hook(hooks, "Notification", &notif_cmd)?;
+    add_hook(hooks, "Stop", &stop_cmd)?;
 
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| format!("serialize: {e}"))?;
     fs::write(&path, pretty + "\n").map_err(|e| format!("write settings: {e}"))?;
     println!("claude-boop: installed hooks in {}", path.display());
+    println!("claude-boop: using binary at {exe}");
     Ok(())
 }
 
@@ -182,6 +191,19 @@ fn add_hook(hooks: &mut Value, event: &str, command: &str) -> Result<(), String>
     Ok(())
 }
 
+fn is_claude_boop_command(cmd: &str) -> bool {
+    let trimmed = cmd.trim_start();
+    if trimmed.starts_with("claude-boop ") {
+        return true;
+    }
+    let first = trimmed.split_whitespace().next().unwrap_or("");
+    std::path::Path::new(first)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .map(|f| f == "claude-boop")
+        .unwrap_or(false)
+}
+
 fn remove_hook(hooks: &mut serde_json::Map<String, Value>, event: &str) {
     let Some(matchers) = hooks.get_mut(event).and_then(|v| v.as_array_mut()) else {
         return;
@@ -193,7 +215,7 @@ fn remove_hook(hooks: &mut serde_json::Map<String, Value>, event: &str) {
         !inner.iter().any(|h| {
             h.get("command")
                 .and_then(|c| c.as_str())
-                .map(|c| c.starts_with("claude-boop "))
+                .map(is_claude_boop_command)
                 .unwrap_or(false)
         })
     });
