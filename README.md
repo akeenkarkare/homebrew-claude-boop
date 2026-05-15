@@ -46,6 +46,8 @@ By default:
 | `claude-boop config set sound true` | Enable or disable sound |
 | `claude-boop config set title true` | Enable or disable terminal title updates |
 | `claude-boop config set notify false` | Enable or disable native notifications |
+| `claude-boop config set quiet "22:00-08:00"` | Set quiet hours (sound + notifications muted) |
+| `claude-boop config set quiet ""` | Disable quiet hours |
 | `claude-boop config reset` | Reset config to defaults |
 | `claude-boop doctor` | Check hooks, config, and local cue backends |
 
@@ -88,6 +90,11 @@ Config lives at `~/.claude/claude-boop.json` (`%USERPROFILE%\.claude\claude-boop
   "sound": true,
   "title": true,
   "notify": true,
+  "quiet": "22:00-08:00",
+  "dangerPatterns": [
+    "(?:^|[\\s;&|])rm\\s+(?:-[a-zA-Z]*[rRfFd]|--recursive|--force)",
+    "(?:^|[\\s;&|])git\\s+push\\s+(?:--force\\b|-f\\b|--force-with-lease\\b)"
+  ],
   "titles": {
     "notification": "Claude • Waiting for approval",
     "stop": "Claude • Done ✓"
@@ -105,13 +112,33 @@ The easiest way to change channels is through the CLI:
 claude-boop config set sound true
 claude-boop config set title true
 claude-boop config set notify false
+claude-boop config set quiet "22:00-08:00"
 ```
 
-You can edit the JSON directly if you want custom terminal titles or notification messages.
+You can edit the JSON directly if you want custom terminal titles, notification messages, or risk patterns.
+
+### Quiet hours
+
+When the current local time falls inside the configured window, claude-boop suppresses **sound** and **native notifications** but still updates the terminal title (silent visual cue). The window is `HH:MM-HH:MM` in 24-hour local time and supports wrap-around midnight (`22:00-08:00` means 10pm through 8am the next morning). Set `quiet` to an empty string to disable.
+
+### Danger sound for risky Bash commands
+
+claude-boop installs a `PreToolUse` hook on `Bash` that plays a distinct, more alarming sound when Claude is about to run something risky — before you decide whether to allow it. Defaults match:
+
+- `rm -rf` / `rm -r` / `rm -f` and `--recursive` / `--force` long forms
+- `git push --force` / `-f` / `--force-with-lease`
+- `git reset --hard`, `git clean -f`
+- `sudo`
+- `curl … | sh` / `wget … | sh` (pipe-to-shell)
+- writes to `/dev/sd*` or `/dev/hd*`
+- `dd if=`, `mkfs.*`, `chmod -R 777`-style, fork bombs
+- `drop database` / `drop table`
+
+To add your own, edit the `dangerPatterns` array (Rust `regex` syntax, case-insensitive). Empty the array to silence the danger sound entirely.
 
 ## Custom sounds
 
-Sounds are compiled into the binary. To use your own, clone the repo, drop replacements into `assets/notification.{aiff,wav}` and `assets/stop.{aiff,wav}` (the `.aiff` files are used on macOS/Linux, the `.wav` files on Windows), then `cargo install --path .`.
+Sounds are compiled into the binary. To use your own, clone the repo, drop replacements into `assets/notification.{aiff,wav}`, `assets/stop.{aiff,wav}`, and `assets/danger.{aiff,wav}` (the `.aiff` files are used on macOS/Linux, the `.wav` files on Windows), then `cargo install --path .`.
 
 ## Platforms
 

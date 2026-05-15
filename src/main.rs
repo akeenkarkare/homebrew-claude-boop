@@ -10,6 +10,8 @@ const NOTIFICATION_SOUND: &[u8] = include_bytes!("../assets/notification.wav");
 #[cfg(target_os = "windows")]
 const STOP_SOUND: &[u8] = include_bytes!("../assets/stop.wav");
 #[cfg(target_os = "windows")]
+const DANGER_SOUND: &[u8] = include_bytes!("../assets/danger.wav");
+#[cfg(target_os = "windows")]
 const SOUND_EXT: &str = "wav";
 
 #[cfg(not(target_os = "windows"))]
@@ -17,7 +19,24 @@ const NOTIFICATION_SOUND: &[u8] = include_bytes!("../assets/notification.aiff");
 #[cfg(not(target_os = "windows"))]
 const STOP_SOUND: &[u8] = include_bytes!("../assets/stop.aiff");
 #[cfg(not(target_os = "windows"))]
+const DANGER_SOUND: &[u8] = include_bytes!("../assets/danger.aiff");
+#[cfg(not(target_os = "windows"))]
 const SOUND_EXT: &str = "aiff";
+
+const DEFAULT_DANGER_PATTERNS: &[&str] = &[
+    r"(?:^|[\s;&|])rm\s+(?:-[a-zA-Z]*[rRfFd]|--recursive|--force)",
+    r"(?:^|[\s;&|])git\s+push\s+(?:--force\b|-f\b|--force-with-lease\b)",
+    r"(?:^|[\s;&|])git\s+reset\s+--hard\b",
+    r"(?:^|[\s;&|])git\s+clean\s+(?:-[a-zA-Z]*f|--force)",
+    r"(?:^|[\s;&|])sudo\b",
+    r"(?:curl|wget)\b[^|&;]*\|\s*(?:sh|bash|zsh|ksh)\b",
+    r">\s*/dev/[sh]d[a-z]",
+    r"(?:^|[\s;&|])dd\s+if=",
+    r":\(\)\s*\{\s*:\|:&\s*\}",
+    r"(?:^|[\s;&|])mkfs\.",
+    r"(?:^|[\s;&|])chmod\s+-R\s+[0-7]*7[0-7]*7",
+    r"\bdrop\s+(?:database|table)\b",
+];
 
 #[derive(Parser)]
 #[command(
@@ -49,6 +68,8 @@ enum Cmd {
         #[arg(long)]
         notify: bool,
     },
+    /// Inspect a PreToolUse hook payload from stdin and play danger sound if risky
+    Pretooluse,
     /// Add claude-boop hooks to ~/.claude/settings.json
     Install {
         /// Explicit channels to enable: sound,title,notify
@@ -70,7 +91,7 @@ enum Cmd {
 enum ConfigCmd {
     /// Print the current config
     Show,
-    /// Set sound, title, or notify to true/false
+    /// Set sound/title/notify (true|false), or quiet ("HH:MM-HH:MM" or "")
     Set { key: String, value: String },
     /// Reset config to defaults
     Reset,
@@ -87,10 +108,41 @@ struct BoopConfig {
     sound: bool,
     title: bool,
     notify: bool,
+    quiet: Option<QuietWindow>,
+    danger_patterns: Vec<String>,
     notification_title: String,
     stop_title: String,
     notification_message: String,
     stop_message: String,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+struct QuietWindow {
+    start_minutes: u16,
+    end_minutes: u16,
+}
+
+impl QuietWindow {
+    fn contains(&self, minute_of_day: u16) -> bool {
+        if self.start_minutes == self.end_minutes {
+            return false;
+        }
+        if self.start_minutes < self.end_minutes {
+            minute_of_day >= self.start_minutes && minute_of_day < self.end_minutes
+        } else {
+            minute_of_day >= self.start_minutes || minute_of_day < self.end_minutes
+        }
+    }
+
+    fn format(&self) -> String {
+        format!(
+            "{:02}:{:02}-{:02}:{:02}",
+            self.start_minutes / 60,
+            self.start_minutes % 60,
+            self.end_minutes / 60,
+            self.end_minutes % 60
+        )
+    }
 }
 
 impl Default for BoopConfig {
@@ -99,6 +151,11 @@ impl Default for BoopConfig {
             sound: true,
             title: true,
             notify: true,
+            quiet: None,
+            danger_patterns: DEFAULT_DANGER_PATTERNS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             notification_title: "Claude • Waiting for approval".to_string(),
             stop_title: "Claude • Done ✓".to_string(),
             notification_message: "Claude needs your attention".to_string(),
@@ -127,6 +184,8 @@ impl BoopConfig {
             "sound": self.sound,
             "title": self.title,
             "notify": self.notify,
+            "quiet": self.quiet.map(|q| q.format()).unwrap_or_default(),
+            "dangerPatterns": self.danger_patterns,
             "titles": {
                 "notification": self.notification_title,
                 "stop": self.stop_title
@@ -143,10 +202,30 @@ impl BoopConfig {
             .as_object()
             .ok_or("config root must be a JSON object")?;
         let defaults = Self::default();
+        let quiet = match object.get("quiet") {
+            Some(Value::String(raw)) if !raw.trim().is_empty() => Some(parse_quiet_window(raw)?),
+            Some(Value::String(_)) | None => None,
+            Some(Value::Null) => None,
+            Some(_) => return Err("config.quiet must be a string like '22:00-08:00'".into()),
+        };
+        let danger_patterns = match object.get("dangerPatterns") {
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| "config.dangerPatterns must be strings".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            None => defaults.danger_patterns.clone(),
+            Some(_) => return Err("config.dangerPatterns must be an array of strings".into()),
+        };
         Ok(Self {
             sound: bool_field(object, "sound", defaults.sound)?,
             title: bool_field(object, "title", defaults.title)?,
             notify: bool_field(object, "notify", defaults.notify)?,
+            quiet,
+            danger_patterns,
             notification_title: nested_string(
                 object,
                 "titles",
@@ -163,6 +242,124 @@ impl BoopConfig {
             stop_message: nested_string(object, "messages", "stop", defaults.stop_message)?,
         })
     }
+}
+
+fn parse_quiet_window(raw: &str) -> Result<QuietWindow, String> {
+    let (start, end) = raw
+        .split_once('-')
+        .ok_or_else(|| format!("quiet hours must be 'HH:MM-HH:MM', got '{raw}'"))?;
+    Ok(QuietWindow {
+        start_minutes: parse_hhmm(start.trim())?,
+        end_minutes: parse_hhmm(end.trim())?,
+    })
+}
+
+fn parse_hhmm(raw: &str) -> Result<u16, String> {
+    let (h, m) = raw
+        .split_once(':')
+        .ok_or_else(|| format!("expected HH:MM, got '{raw}'"))?;
+    let hours: u16 = h
+        .parse()
+        .map_err(|_| format!("invalid hours '{h}' in '{raw}'"))?;
+    let minutes: u16 = m
+        .parse()
+        .map_err(|_| format!("invalid minutes '{m}' in '{raw}'"))?;
+    if hours > 23 {
+        return Err(format!("hours must be 0-23, got {hours}"));
+    }
+    if minutes > 59 {
+        return Err(format!("minutes must be 0-59, got {minutes}"));
+    }
+    Ok(hours * 60 + minutes)
+}
+
+fn local_minute_of_day() -> u16 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs_since_epoch = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as i64;
+    let offset = local_utc_offset_seconds();
+    let local_secs = secs_since_epoch + offset;
+    let day_seconds = local_secs.rem_euclid(86_400);
+    (day_seconds / 60) as u16
+}
+
+#[cfg(unix)]
+fn local_utc_offset_seconds() -> i64 {
+    use std::process::Command;
+    Command::new("date")
+        .args(["+%z"])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8(o.stdout).ok()?;
+            parse_utc_offset(s.trim())
+        })
+        .unwrap_or(0)
+    // %z prints like -0700; if anything fails, UTC is a safe degraded mode.
+}
+
+#[cfg(windows)]
+fn local_utc_offset_seconds() -> i64 {
+    use std::process::Command;
+    Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "(Get-Date).ToString('zzz')",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8(o.stdout).ok()?;
+            parse_iso_offset(s.trim())
+        })
+        .unwrap_or(0)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn local_utc_offset_seconds() -> i64 {
+    0
+}
+
+fn parse_utc_offset(raw: &str) -> Option<i64> {
+    // Accepts ±HHMM
+    if raw.len() < 5 {
+        return None;
+    }
+    let sign = match raw.chars().next()? {
+        '+' => 1,
+        '-' => -1,
+        _ => return None,
+    };
+    let hours: i64 = raw.get(1..3)?.parse().ok()?;
+    let minutes: i64 = raw.get(3..5)?.parse().ok()?;
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+#[cfg(windows)]
+fn parse_iso_offset(raw: &str) -> Option<i64> {
+    // Accepts ±HH:MM
+    if raw.len() < 6 {
+        return None;
+    }
+    let sign = match raw.chars().next()? {
+        '+' => 1,
+        '-' => -1,
+        _ => return None,
+    };
+    let hours: i64 = raw.get(1..3)?.parse().ok()?;
+    let minutes: i64 = raw.get(4..6)?.parse().ok()?;
+    Some(sign * (hours * 3600 + minutes * 60))
+}
+
+fn is_quiet_now(config: &BoopConfig) -> bool {
+    config
+        .quiet
+        .map(|window| window.contains(local_minute_of_day()))
+        .unwrap_or(false)
 }
 
 #[derive(Copy, Clone)]
@@ -182,6 +379,7 @@ fn main() {
             title,
             notify,
         } => play(event, sound_only, no_sound, title, notify),
+        Cmd::Pretooluse => pretooluse(),
         Cmd::Install { visual } => install(visual),
         Cmd::Uninstall => uninstall(),
         Cmd::Config { command } => config_command(command),
@@ -223,6 +421,11 @@ fn play(
         channels.notify = true;
     }
 
+    if is_quiet_now(&config) {
+        channels.sound = false;
+        channels.notify = false;
+    }
+
     if channels.title {
         set_terminal_title(config.title_for(event));
     }
@@ -233,6 +436,66 @@ fn play(
         let _ = play_sound(event);
     }
     Ok(())
+}
+
+fn pretooluse() -> Result<(), String> {
+    use std::io::Read;
+    let config = read_config()?.unwrap_or_default();
+    if is_quiet_now(&config) || !config.sound {
+        return Ok(());
+    }
+
+    let mut buf = String::new();
+    if std::io::stdin().read_to_string(&mut buf).is_err() || buf.trim().is_empty() {
+        return Ok(());
+    }
+    let payload: Value = match serde_json::from_str(&buf) {
+        Ok(v) => v,
+        Err(_) => return Ok(()),
+    };
+    let tool_name = payload
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if !tool_name.eq_ignore_ascii_case("bash") {
+        return Ok(());
+    }
+    let command = payload
+        .pointer("/tool_input/command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if command.is_empty() {
+        return Ok(());
+    }
+    if !command_is_risky(command, &config.danger_patterns) {
+        return Ok(());
+    }
+    let _ = play_danger_sound();
+    Ok(())
+}
+
+fn command_is_risky(command: &str, patterns: &[String]) -> bool {
+    patterns
+        .iter()
+        .filter_map(|p| regex::RegexBuilder::new(p).case_insensitive(true).build().ok())
+        .any(|re| re.is_match(command))
+}
+
+fn play_danger_sound() -> Result<(), String> {
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "claude-boop-danger-{}.{}",
+        std::process::id(),
+        SOUND_EXT
+    ));
+    {
+        let mut f = fs::File::create(&path).map_err(|e| format!("temp file: {e}"))?;
+        f.write_all(DANGER_SOUND)
+            .map_err(|e| format!("write: {e}"))?;
+    }
+    let status = player_command(&path);
+    let _ = fs::remove_file(&path);
+    status
 }
 
 fn play_sound(event: Event) -> Result<(), String> {
@@ -338,8 +601,10 @@ fn install(visual: Option<String>) -> Result<(), String> {
     let exe_cmd = quote_command_part(&exe);
     let notif_cmd = format!("{exe_cmd} play --event notification");
     let stop_cmd = format!("{exe_cmd} play --event stop");
-    add_hook(hooks, "Notification", &notif_cmd)?;
-    add_hook(hooks, "Stop", &stop_cmd)?;
+    let pretooluse_cmd = format!("{exe_cmd} pretooluse");
+    add_hook(hooks, "Notification", None, &notif_cmd)?;
+    add_hook(hooks, "Stop", None, &stop_cmd)?;
+    add_hook(hooks, "PreToolUse", Some("Bash"), &pretooluse_cmd)?;
 
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| format!("serialize: {e}"))?;
     fs::write(&path, pretty + "\n").map_err(|e| format!("write settings: {e}"))?;
@@ -359,7 +624,7 @@ fn uninstall() -> Result<(), String> {
     let mut root: Value =
         serde_json::from_str(&raw).map_err(|e| format!("parse settings.json: {e}"))?;
     if let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) {
-        for event in ["Notification", "Stop"] {
+        for event in ["Notification", "Stop", "PreToolUse"] {
             remove_hook(hooks, event);
         }
     }
@@ -369,7 +634,12 @@ fn uninstall() -> Result<(), String> {
     Ok(())
 }
 
-fn add_hook(hooks: &mut Value, event: &str, command: &str) -> Result<(), String> {
+fn add_hook(
+    hooks: &mut Value,
+    event: &str,
+    matcher: Option<&str>,
+    command: &str,
+) -> Result<(), String> {
     let hooks_obj = hooks
         .as_object_mut()
         .ok_or("settings.hooks is not an object")?;
@@ -380,9 +650,8 @@ fn add_hook(hooks: &mut Value, event: &str, command: &str) -> Result<(), String>
         .as_array_mut()
         .ok_or_else(|| format!("settings.hooks.{event} is not an array"))?;
 
-    let already_present = arr.iter().any(|matcher| {
-        matcher
-            .get("hooks")
+    let already_present = arr.iter().any(|m| {
+        m.get("hooks")
             .and_then(|h| h.as_array())
             .map(|inner| {
                 inner
@@ -395,9 +664,16 @@ fn add_hook(hooks: &mut Value, event: &str, command: &str) -> Result<(), String>
         return Ok(());
     }
 
-    arr.push(json!({
+    let mut entry = json!({
         "hooks": [{ "type": "command", "command": command }]
-    }));
+    });
+    if let Some(m) = matcher {
+        entry
+            .as_object_mut()
+            .expect("entry is object")
+            .insert("matcher".into(), Value::String(m.to_string()));
+    }
+    arr.push(entry);
     Ok(())
 }
 
@@ -502,13 +778,23 @@ fn config_command(command: ConfigCmd) -> Result<(), String> {
             Ok(())
         }
         ConfigCmd::Set { key, value } => {
-            let value = parse_bool(&value)?;
             let mut config = read_config()?.unwrap_or_default();
             match key.as_str() {
-                "sound" => config.sound = value,
-                "title" => config.title = value,
-                "notify" => config.notify = value,
-                _ => return Err("config key must be sound, title, or notify".into()),
+                "sound" => config.sound = parse_bool(&value)?,
+                "title" => config.title = parse_bool(&value)?,
+                "notify" => config.notify = parse_bool(&value)?,
+                "quiet" => {
+                    config.quiet = if value.trim().is_empty() {
+                        None
+                    } else {
+                        Some(parse_quiet_window(value.trim())?)
+                    };
+                }
+                _ => {
+                    return Err(
+                        "config key must be sound, title, notify, or quiet".into(),
+                    )
+                }
             }
             write_config(&config)?;
             println!("claude-boop: set {key} to {value}");
@@ -528,8 +814,12 @@ fn doctor() -> Result<(), String> {
     if settings.exists() {
         match read_settings() {
             Ok(root) => {
-                let installed = hooks_installed(&root);
-                println!("hooks installed: {}", exists_label(installed));
+                for event in ["Notification", "Stop", "PreToolUse"] {
+                    println!(
+                        "hook {event}: {}",
+                        exists_label(event_hook_installed(&root, event))
+                    );
+                }
             }
             Err(e) => println!("hooks installed: no ({e})"),
         }
@@ -537,15 +827,39 @@ fn doctor() -> Result<(), String> {
         println!("hooks installed: no");
     }
 
-    let config = config_path()?;
-    match read_config() {
-        Ok(Some(_)) => println!("config file: valid ({})", config.display()),
-        Ok(None) => println!(
-            "config file: missing, defaults will be used ({})",
-            config.display()
+    let config_path = config_path()?;
+    let config = match read_config() {
+        Ok(Some(c)) => {
+            println!("config file: valid ({})", config_path.display());
+            Some(c)
+        }
+        Ok(None) => {
+            println!(
+                "config file: missing, defaults will be used ({})",
+                config_path.display()
+            );
+            None
+        }
+        Err(e) => {
+            println!("config file: invalid ({e})");
+            None
+        }
+    };
+
+    let effective = config.clone().unwrap_or_default();
+    match effective.quiet {
+        Some(window) => println!(
+            "quiet hours: {}{}",
+            window.format(),
+            if window.contains(local_minute_of_day()) {
+                " (currently quiet)"
+            } else {
+                ""
+            }
         ),
-        Err(e) => println!("config file: invalid ({e})"),
+        None => println!("quiet hours: off"),
     }
+    println!("danger patterns: {}", effective.danger_patterns.len());
 
     println!(
         "sound backend: {}",
@@ -683,32 +997,37 @@ fn read_settings() -> Result<Value, String> {
     serde_json::from_str(&raw).map_err(|e| format!("parse settings.json: {e}"))
 }
 
-fn hooks_installed(root: &Value) -> bool {
+fn event_hook_installed(root: &Value, event: &str) -> bool {
     let Some(hooks) = root.get("hooks").and_then(|h| h.as_object()) else {
         return false;
     };
-    ["Notification", "Stop"].iter().all(|event| {
-        hooks
-            .get(*event)
-            .and_then(|v| v.as_array())
-            .map(|matchers| {
-                matchers.iter().any(|matcher| {
-                    matcher
-                        .get("hooks")
-                        .and_then(|h| h.as_array())
-                        .map(|inner| {
-                            inner.iter().any(|h| {
-                                h.get("command")
-                                    .and_then(|c| c.as_str())
-                                    .map(is_claude_boop_command)
-                                    .unwrap_or(false)
-                            })
+    hooks
+        .get(event)
+        .and_then(|v| v.as_array())
+        .map(|matchers| {
+            matchers.iter().any(|matcher| {
+                matcher
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|inner| {
+                        inner.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(is_claude_boop_command)
+                                .unwrap_or(false)
                         })
-                        .unwrap_or(false)
-                })
+                    })
+                    .unwrap_or(false)
             })
-            .unwrap_or(false)
-    })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+fn hooks_installed(root: &Value) -> bool {
+    ["Notification", "Stop", "PreToolUse"]
+        .iter()
+        .all(|event| event_hook_installed(root, event))
 }
 
 fn set_terminal_title(title: &str) {
@@ -915,14 +1234,28 @@ mod tests {
     }
 
     #[test]
-    fn hook_installed_requires_both_events() {
+    fn hook_installed_requires_all_three_events() {
+        let root = json!({
+            "hooks": {
+                "Notification": [{ "hooks": [{ "type": "command", "command": "claude-boop play --event notification" }] }],
+                "Stop": [{ "hooks": [{ "type": "command", "command": "claude-boop play --event stop" }] }],
+                "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "claude-boop pretooluse" }] }]
+            }
+        });
+        assert!(hooks_installed(&root));
+    }
+
+    #[test]
+    fn hook_installed_false_when_pretooluse_missing() {
         let root = json!({
             "hooks": {
                 "Notification": [{ "hooks": [{ "type": "command", "command": "claude-boop play --event notification" }] }],
                 "Stop": [{ "hooks": [{ "type": "command", "command": "claude-boop play --event stop" }] }]
             }
         });
-        assert!(hooks_installed(&root));
+        assert!(!hooks_installed(&root));
+        assert!(event_hook_installed(&root, "Notification"));
+        assert!(!event_hook_installed(&root, "PreToolUse"));
     }
 
     #[test]
@@ -931,18 +1264,32 @@ mod tests {
         add_hook(
             &mut hooks,
             "Notification",
+            None,
             "claude-boop play --event notification",
         )
         .unwrap();
         add_hook(
             &mut hooks,
             "Notification",
+            None,
             "claude-boop play --event notification",
         )
         .unwrap();
 
         let count = hooks["Notification"].as_array().unwrap().len();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn add_hook_includes_matcher_when_given() {
+        let mut hooks = json!({});
+        add_hook(&mut hooks, "PreToolUse", Some("Bash"), "claude-boop pretooluse").unwrap();
+        let entry = &hooks["PreToolUse"][0];
+        assert_eq!(entry["matcher"].as_str(), Some("Bash"));
+        assert_eq!(
+            entry["hooks"][0]["command"].as_str(),
+            Some("claude-boop pretooluse")
+        );
     }
 
     #[test]
@@ -963,5 +1310,86 @@ mod tests {
             remaining[0]["hooks"][0]["command"].as_str().unwrap(),
             "echo keep-me"
         );
+    }
+
+    #[test]
+    fn quiet_window_handles_overnight_range() {
+        let window = parse_quiet_window("22:00-08:00").unwrap();
+        assert!(window.contains(23 * 60));
+        assert!(window.contains(2 * 60));
+        assert!(window.contains(7 * 60 + 59));
+        assert!(!window.contains(8 * 60));
+        assert!(!window.contains(15 * 60));
+    }
+
+    #[test]
+    fn quiet_window_handles_same_day_range() {
+        let window = parse_quiet_window("13:00-17:30").unwrap();
+        assert!(window.contains(13 * 60));
+        assert!(window.contains(17 * 60));
+        assert!(!window.contains(17 * 60 + 30));
+        assert!(!window.contains(12 * 60 + 59));
+    }
+
+    #[test]
+    fn quiet_window_rejects_invalid_input() {
+        assert!(parse_quiet_window("25:00-08:00").is_err());
+        assert!(parse_quiet_window("22:00").is_err());
+        assert!(parse_quiet_window("22:60-08:00").is_err());
+    }
+
+    #[test]
+    fn config_round_trips_quiet_hours() {
+        let mut config = BoopConfig::default();
+        config.quiet = Some(parse_quiet_window("22:00-08:00").unwrap());
+        let parsed = BoopConfig::from_json(config.to_json()).unwrap();
+        assert_eq!(parsed.quiet, config.quiet);
+    }
+
+    #[test]
+    fn config_treats_empty_quiet_as_none() {
+        let config = BoopConfig::from_json(json!({ "quiet": "" })).unwrap();
+        assert!(config.quiet.is_none());
+    }
+
+    #[test]
+    fn default_danger_patterns_all_compile() {
+        for pattern in DEFAULT_DANGER_PATTERNS {
+            regex::RegexBuilder::new(pattern)
+                .case_insensitive(true)
+                .build()
+                .unwrap_or_else(|e| panic!("default pattern {pattern:?} did not compile: {e}"));
+        }
+    }
+
+    #[test]
+    fn danger_patterns_match_dangerous_commands() {
+        let defaults: Vec<String> = DEFAULT_DANGER_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(command_is_risky("rm -rf /tmp/foo", &defaults));
+        assert!(command_is_risky("RM -RF /tmp/foo", &defaults));
+        assert!(command_is_risky("git push --force origin main", &defaults));
+        assert!(command_is_risky("git push -f origin main", &defaults));
+        assert!(command_is_risky("git reset --hard HEAD~3", &defaults));
+        assert!(command_is_risky("sudo apt update", &defaults));
+        assert!(command_is_risky("curl https://x.sh | sh", &defaults));
+        assert!(command_is_risky("dd if=/dev/zero of=/dev/sda", &defaults));
+    }
+
+    #[test]
+    fn danger_patterns_skip_safe_commands() {
+        let defaults: Vec<String> = DEFAULT_DANGER_PATTERNS
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(!command_is_risky("ls -la", &defaults));
+        assert!(!command_is_risky("npm install", &defaults));
+        assert!(!command_is_risky("git push origin main", &defaults));
+        assert!(!command_is_risky("echo 'rm -rf is dangerous'", &defaults));
+        assert!(!command_is_risky("git log --all", &defaults));
+        // "rm" alone without -r/-f shouldn't fire
+        assert!(!command_is_risky("rm single-file.txt", &defaults));
     }
 }
